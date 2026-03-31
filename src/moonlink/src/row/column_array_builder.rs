@@ -9,7 +9,7 @@ use arrow::array::{
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, FieldRef};
+use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
 use arrow::error::ArrowError;
 use std::sync::Arc;
 
@@ -178,8 +178,11 @@ impl ColumnArrayBuilder {
             DataType::Int16 | DataType::Int32 | DataType::Date32 => {
                 Self::Int32(PrimitiveBuilder::<Int32Type>::with_capacity(capacity))
             }
-            DataType::Timestamp(_, _) | DataType::Int64 | DataType::Time64(_) => {
+            DataType::Timestamp(_, _) | DataType::Int64 | DataType::Time64(_) | DataType::Duration(_) => {
                 Self::Int64(PrimitiveBuilder::<Int64Type>::with_capacity(capacity))
+            }
+            DataType::Interval(IntervalUnit::YearMonth) => {
+                Self::Int32(PrimitiveBuilder::<Int32Type>::with_capacity(capacity))
             }
             DataType::Float32 => {
                 Self::Float32(PrimitiveBuilder::<Float32Type>::with_capacity(capacity))
@@ -382,14 +385,18 @@ impl ColumnArrayBuilder {
             Self::Int32(mut b) => {
                 let arr: ArrayRef = Arc::new(b.finish());
                 match logical_type {
-                    DataType::Date32 | DataType::Int16 => cast(&arr, logical_type).unwrap(),
+                    DataType::Date32
+                    | DataType::Int16
+                    | DataType::Interval(IntervalUnit::YearMonth) => {
+                        cast(&arr, logical_type).unwrap()
+                    }
                     _ => arr,
                 }
             }
             Self::Int64(mut b) => {
                 let arr: ArrayRef = Arc::new(b.finish());
                 match logical_type {
-                    DataType::Timestamp(_, _) | DataType::Time64(_) => {
+                    DataType::Timestamp(_, _) | DataType::Time64(_) | DataType::Duration(_) => {
                         cast(&arr, logical_type).unwrap()
                     }
                     _ => arr,
@@ -1412,5 +1419,62 @@ mod tests {
         assert_eq!(map_array.len(), 2);
         assert_eq!(map_array.value(0).len(), 1);
         assert_eq!(map_array.value(1).len(), 2);
+    }
+
+    /// Regression tests for IvorySQL interval types:
+    /// - yminterval → DataType::Interval(YearMonth), stored as Cell::I32 → RowValue::Int32
+    /// - dsinterval → DataType::Duration(Microsecond), stored as Cell::I64 → RowValue::Int64
+    #[test]
+    fn test_ivory_yminterval_column_builder() {
+        use arrow::array::IntervalYearMonthArray;
+        use arrow::datatypes::{DataType, IntervalUnit};
+
+        let dt = DataType::Interval(IntervalUnit::YearMonth);
+        let mut builder = ColumnArrayBuilder::new(&dt, 4);
+
+        // 2 years 3 months = 27 months
+        builder.append_value(&RowValue::Int32(27)).unwrap();
+        // negative: -(1 year 6 months) = -18 months
+        builder.append_value(&RowValue::Int32(-18)).unwrap();
+        // zero
+        builder.append_value(&RowValue::Int32(0)).unwrap();
+        // null
+        builder.append_value(&RowValue::Null).unwrap();
+
+        let array = builder.finish(&dt);
+        let arr = array.as_any().downcast_ref::<IntervalYearMonthArray>()
+            .expect("should be IntervalYearMonthArray");
+
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.value(0), 27);
+        assert_eq!(arr.value(1), -18);
+        assert_eq!(arr.value(2), 0);
+        assert!(arr.is_null(3));
+    }
+
+    #[test]
+    fn test_ivory_dsinterval_column_builder() {
+        use arrow::array::DurationMicrosecondArray;
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        let dt = DataType::Duration(TimeUnit::Microsecond);
+        let mut builder = ColumnArrayBuilder::new(&dt, 3);
+
+        // 5 days in microseconds
+        let five_days_us: i64 = 5 * 86_400 * 1_000_000;
+        builder.append_value(&RowValue::Int64(five_days_us)).unwrap();
+        // negative: -1 day
+        builder.append_value(&RowValue::Int64(-86_400 * 1_000_000)).unwrap();
+        // null
+        builder.append_value(&RowValue::Null).unwrap();
+
+        let array = builder.finish(&dt);
+        let arr = array.as_any().downcast_ref::<DurationMicrosecondArray>()
+            .expect("should be DurationMicrosecondArray");
+
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.value(0), five_days_us);
+        assert_eq!(arr.value(1), -86_400 * 1_000_000);
+        assert!(arr.is_null(2));
     }
 }

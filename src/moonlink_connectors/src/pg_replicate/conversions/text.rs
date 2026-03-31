@@ -11,6 +11,7 @@ use tokio_postgres::types::{Kind, Type};
 use uuid::Uuid;
 
 use crate::pg_replicate::conversions::{bool::parse_bool, hex};
+use crate::pg_replicate::ivoryql_types;
 
 use super::{bool::ParseBoolError, hex::ByteaHexParseError, numeric::PgNumeric, ArrayCell, Cell};
 
@@ -55,6 +56,76 @@ pub enum FromTextError {
 
 pub struct TextFormatConverter;
 
+/// Parse an Oracle INTERVAL YEAR TO MONTH text value into total months (i32).
+///
+/// Oracle canonical format: `+YY-MM` or `-YY-MM` (leading sign optional).
+/// Arrow `Interval(YearMonth)` stores months as i32.
+fn parse_yminterval(s: &str) -> Result<Cell, FromTextError> {
+    let s = s.trim();
+    let (negative, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s.strip_prefix('+').unwrap_or(s))
+    };
+    let (years_str, months_str) = s.split_once('-').ok_or_else(|| {
+        FromTextError::InvalidConversion(format!("invalid yminterval: {s}"))
+    })?;
+    let years: i32 = years_str.parse()?;
+    let months: i32 = months_str.parse()?;
+    let total = years
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(months))
+        .ok_or_else(|| {
+            FromTextError::InvalidConversion(format!("yminterval value out of i32 range: {s}"))
+        })?;
+    Ok(Cell::I32(if negative { -total } else { total }))
+}
+
+/// Parse an Oracle INTERVAL DAY TO SECOND text value into microseconds (i64).
+///
+/// Oracle canonical format: `+DDDDDDDDD HH:MM:SS.FFFFFFFFF` (leading sign optional,
+/// up to 9 fractional second digits).
+/// Arrow `Duration(Microsecond)` stores microseconds as i64.
+fn parse_dsinterval(s: &str) -> Result<Cell, FromTextError> {
+    let s = s.trim();
+    let (negative, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s.strip_prefix('+').unwrap_or(s))
+    };
+    let (days_str, time_str) = s.split_once(' ').ok_or_else(|| {
+        FromTextError::InvalidConversion(format!("invalid dsinterval: {s}"))
+    })?;
+    let days: i64 = days_str.parse()?;
+
+    // time_str is "HH:MM:SS" or "HH:MM:SS.FFFFFFFFF"
+    let (hms, frac_str) = time_str.split_once('.').unwrap_or((time_str, "0"));
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return Err(FromTextError::InvalidConversion(format!(
+            "invalid time in dsinterval: {s}"
+        )));
+    }
+    let hours: i64 = parts[0].parse()?;
+    let mins: i64 = parts[1].parse()?;
+    let secs: i64 = parts[2].parse()?;
+
+    // Pad or truncate fractional part to 9 digits (right-pad with zeros), then take leading 6 for microseconds.
+    let frac_padded = format!("{:0<9}", frac_str);
+    let micros_frac: i64 = frac_padded[..6.min(frac_padded.len())].parse().unwrap_or(0);
+
+    let total_us = days
+        .checked_mul(86_400 * 1_000_000)
+        .and_then(|v| v.checked_add(hours * 3_600 * 1_000_000))
+        .and_then(|v| v.checked_add(mins * 60 * 1_000_000))
+        .and_then(|v| v.checked_add(secs * 1_000_000))
+        .and_then(|v| v.checked_add(micros_frac))
+        .ok_or_else(|| {
+            FromTextError::InvalidConversion(format!("dsinterval value out of i64 range: {s}"))
+        })?;
+    Ok(Cell::I64(if negative { -total_us } else { total_us }))
+}
+
 #[derive(Debug, Error)]
 pub enum ArrayParseError {
     #[error("input too short")]
@@ -79,51 +150,53 @@ pub enum CompositeParseError {
 impl TextFormatConverter {
     pub fn is_supported_type(typ: &Type) -> bool {
         match typ.kind() {
-            Kind::Simple => matches!(
-                *typ,
-                Type::BOOL
-                    | Type::BOOL_ARRAY
-                    | Type::CHAR
-                    | Type::BPCHAR
-                    | Type::VARCHAR
-                    | Type::NAME
-                    | Type::TEXT
-                    | Type::CHAR_ARRAY
-                    | Type::BPCHAR_ARRAY
-                    | Type::VARCHAR_ARRAY
-                    | Type::NAME_ARRAY
-                    | Type::TEXT_ARRAY
-                    | Type::INT2
-                    | Type::INT2_ARRAY
-                    | Type::INT4
-                    | Type::INT4_ARRAY
-                    | Type::INT8
-                    | Type::INT8_ARRAY
-                    | Type::FLOAT4
-                    | Type::FLOAT4_ARRAY
-                    | Type::FLOAT8
-                    | Type::FLOAT8_ARRAY
-                    | Type::NUMERIC
-                    | Type::NUMERIC_ARRAY
-                    | Type::BYTEA
-                    | Type::BYTEA_ARRAY
-                    | Type::DATE
-                    | Type::DATE_ARRAY
-                    | Type::TIME
-                    | Type::TIME_ARRAY
-                    | Type::TIMESTAMP
-                    | Type::TIMESTAMP_ARRAY
-                    | Type::TIMESTAMPTZ
-                    | Type::TIMESTAMPTZ_ARRAY
-                    | Type::UUID
-                    | Type::UUID_ARRAY
-                    | Type::JSON
-                    | Type::JSON_ARRAY
-                    | Type::JSONB
-                    | Type::JSONB_ARRAY
-                    | Type::OID
-                    | Type::OID_ARRAY
-            ),
+            Kind::Simple => {
+                matches!(
+                    *typ,
+                    Type::BOOL
+                        | Type::BOOL_ARRAY
+                        | Type::CHAR
+                        | Type::BPCHAR
+                        | Type::VARCHAR
+                        | Type::NAME
+                        | Type::TEXT
+                        | Type::CHAR_ARRAY
+                        | Type::BPCHAR_ARRAY
+                        | Type::VARCHAR_ARRAY
+                        | Type::NAME_ARRAY
+                        | Type::TEXT_ARRAY
+                        | Type::INT2
+                        | Type::INT2_ARRAY
+                        | Type::INT4
+                        | Type::INT4_ARRAY
+                        | Type::INT8
+                        | Type::INT8_ARRAY
+                        | Type::FLOAT4
+                        | Type::FLOAT4_ARRAY
+                        | Type::FLOAT8
+                        | Type::FLOAT8_ARRAY
+                        | Type::NUMERIC
+                        | Type::NUMERIC_ARRAY
+                        | Type::BYTEA
+                        | Type::BYTEA_ARRAY
+                        | Type::DATE
+                        | Type::DATE_ARRAY
+                        | Type::TIME
+                        | Type::TIME_ARRAY
+                        | Type::TIMESTAMP
+                        | Type::TIMESTAMP_ARRAY
+                        | Type::TIMESTAMPTZ
+                        | Type::TIMESTAMPTZ_ARRAY
+                        | Type::UUID
+                        | Type::UUID_ARRAY
+                        | Type::JSON
+                        | Type::JSON_ARRAY
+                        | Type::JSONB
+                        | Type::JSONB_ARRAY
+                        | Type::OID
+                        | Type::OID_ARRAY
+                ) || ivoryql_types::is_ivory_type(typ)
+            }
             Kind::Array(_) => true,
             Kind::Composite(_) => true,
             _ => false,
@@ -186,7 +259,13 @@ impl TextFormatConverter {
                         _ => Cell::Null,              // Unknown array type
                     }
                 }
-                _ => Cell::Null,
+                _ => {
+                    if ivoryql_types::is_ivory_type(typ) {
+                        TextFormatConverter::ivory_default_value(typ.name())
+                    } else {
+                        Cell::Null
+                    }
+                }
             },
         }
     }
@@ -359,8 +438,97 @@ impl TextFormatConverter {
                         ))),
                     }
                 }
-                _ => Err(FromTextError::InvalidConversion(format!("{:?}", typ))),
+                _ => {
+                    if ivoryql_types::is_ivory_type(typ) {
+                        TextFormatConverter::try_ivory_from_str(typ.name(), str)
+                    } else {
+                        Err(FromTextError::InvalidConversion(format!("{:?}", typ)))
+                    }
+                }
             },
+        }
+    }
+
+    /// Parse an IvorySQL Oracle-mode type from its WAL/COPY text representation.
+    ///
+    /// Called from `try_from_str` when the type has `Kind::Simple` and an IvorySQL
+    /// `pg_type.typname`. Each type is mapped to the closest existing `Cell` variant
+    /// so that the downstream `Cell → RowValue` conversion requires no changes.
+    fn try_ivory_from_str(type_name: &str, str: &str) -> Result<Cell, FromTextError> {
+        use ivoryql_types::*;
+        match type_name {
+            // Oracle DATE and TIMESTAMP: both map to Cell::TimeStamp.
+            // Oracle DATE format is "YYYY-MM-DD HH:MM:SS" (no fractional seconds).
+            // Oracle TIMESTAMP may have up to 9 fractional second digits.
+            // Try the more precise format first, then fall back to the shorter one.
+            IVORY_DATE | IVORY_TIMESTAMP => {
+                let val = NaiveDateTime::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f")
+                    .or_else(|_| NaiveDateTime::parse_from_str(str, "%Y-%m-%d %H:%M:%S"))
+                    .or_else(|_| {
+                        // IvorySQL may output oradate as date-only "YYYY-MM-DD" when not in
+                        // Oracle-compatible session mode (e.g. during COPY with default session).
+                        chrono::NaiveDate::parse_from_str(str, "%Y-%m-%d")
+                            .map(|d| d.and_hms_opt(0, 0, 0).expect("midnight is always valid"))
+                    })?;
+                Ok(Cell::TimeStamp(val))
+            }
+
+            // Oracle TIMESTAMP WITH TIME ZONE / WITH LOCAL TIME ZONE → Cell::TimeStampTz.
+            // Reuse the same two-format fallback strategy as PG TIMESTAMPTZ.
+            IVORY_TIMESTAMPTZ | IVORY_TIMESTAMPLTZ => {
+                let val =
+                    match DateTime::<FixedOffset>::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f%#z") {
+                        Ok(v) => v,
+                        Err(_) => {
+                            DateTime::<FixedOffset>::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f%:z")?
+                        }
+                    };
+                Ok(Cell::TimeStampTz(val.into()))
+            }
+
+            // Oracle INTERVAL YEAR TO MONTH: "+YY-MM" → total months as Cell::I32.
+            IVORY_YMINTERVAL => parse_yminterval(str),
+
+            // Oracle INTERVAL DAY TO SECOND: "+DDDDDDDDD HH:MM:SS.FFFFFFFFF" → µs as Cell::I64.
+            IVORY_DSINTERVAL => parse_dsinterval(str),
+
+            // NUMBER is parsed as PgNumeric regardless of precision modifier, matching PG NUMERIC.
+            // Both NUMBER(p,s) and untyped NUMBER map to Decimal128 in Arrow; NaN/Inf → NULL.
+            IVORY_NUMBER => Ok(Cell::Numeric(str.parse()?)),
+
+            IVORY_BINARY_FLOAT => Ok(Cell::F32(str.parse()?)),
+            IVORY_BINARY_DOUBLE => Ok(Cell::F64(str.parse()?)),
+
+            // Character types — plain string copy, same as PG TEXT/VARCHAR.
+            IVORY_VARCHAR2_CHAR | IVORY_VARCHAR2_BYTE | IVORY_CHAR_CHAR | IVORY_CHAR_BYTE
+            | IVORY_XMLTYPE => Ok(Cell::String(str.to_string())),
+
+            // RAW / LONG RAW — hexadecimal bytea format, same as PG BYTEA.
+            IVORY_RAW | IVORY_LONG_RAW => Ok(Cell::Bytes(hex::from_bytea_hex(str)?)),
+
+            _ => Err(FromTextError::InvalidConversion(format!(
+                "unrecognised IvorySQL type: {type_name}"
+            ))),
+        }
+    }
+
+    /// Default (zero) `Cell` for an IvorySQL type, used when a WAL column arrives as
+    /// `UnchangedToast` (value not retransmitted).
+    fn ivory_default_value(type_name: &str) -> Cell {
+        use ivoryql_types::*;
+        match type_name {
+            IVORY_DATE | IVORY_TIMESTAMP => Cell::TimeStamp(NaiveDateTime::MIN),
+            IVORY_TIMESTAMPTZ | IVORY_TIMESTAMPLTZ => {
+                Cell::TimeStampTz(DateTime::<Utc>::from_naive_utc_and_offset(NaiveDateTime::MIN, Utc))
+            }
+            IVORY_YMINTERVAL => Cell::I32(0),
+            IVORY_DSINTERVAL => Cell::I64(0),
+            IVORY_NUMBER => Cell::Numeric(PgNumeric::default()),
+            IVORY_BINARY_FLOAT => Cell::F32(0.0),
+            IVORY_BINARY_DOUBLE => Cell::F64(0.0),
+            IVORY_RAW | IVORY_LONG_RAW => Cell::Bytes(Vec::default()),
+            // VARCHAR2 variants, CHAR variants, XMLTYPE
+            _ => Cell::String(String::default()),
         }
     }
 
@@ -1118,6 +1286,249 @@ mod tests {
             Err(FromTextError::InvalidComposite(
                 CompositeParseError::FieldCountMismatch
             ))
+        ));
+    }
+
+    #[test]
+    fn test_is_supported_type_accepts_ivory_types() {
+        use tokio_postgres::types::{Kind, Type};
+        for name in [
+            "oradate",
+            "oratimestamp",
+            "oratimestamptz",
+            "oratimestampltz",
+            "yminterval",
+            "dsinterval",
+            "number",
+            "binary_float",
+            "binary_double",
+            "oravarcharchar",
+            "oravarcharbyte",
+            "oracharchar",
+            "oracharbyte",
+            "raw",
+            "long_raw",
+            "xmltype",
+        ] {
+            let typ = Type::new(name.to_string(), 99000, Kind::Simple, "sys".to_string());
+            assert!(
+                TextFormatConverter::is_supported_type(&typ),
+                "is_supported_type should return true for IvorySQL type '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_supported_type_rejects_unknown_simple_type() {
+        use tokio_postgres::types::{Kind, Type};
+        let typ = Type::new(
+            "completely_unknown".to_string(),
+            99999,
+            Kind::Simple,
+            "pg_catalog".to_string(),
+        );
+        assert!(
+            !TextFormatConverter::is_supported_type(&typ),
+            "is_supported_type should return false for truly unknown types"
+        );
+    }
+
+    // ── IvorySQL CDC text parsing tests ──────────────────────────────────────
+    //
+    // These tests exercise try_from_str / default_value for IvorySQL types by
+    // constructing synthetic Type values (Kind::Simple, pg_type.typname = internal
+    // name) — no live database connection required.
+
+    fn ivory_type(name: &str) -> tokio_postgres::types::Type {
+        use tokio_postgres::types::{Kind, Type};
+        Type::new(name.to_string(), 99000, Kind::Simple, "sys".to_string())
+    }
+
+    #[test]
+    fn test_ivory_oradate_parses_datetime() {
+        use chrono::{Datelike, Timelike};
+        let typ = ivory_type("oradate");
+        // No fractional seconds (standard Oracle DATE format)
+        let cell = TextFormatConverter::try_from_str(&typ, "2024-03-15 10:30:00").unwrap();
+        assert!(matches!(cell, Cell::TimeStamp(_)), "oradate must parse to Cell::TimeStamp");
+        if let Cell::TimeStamp(dt) = cell {
+            assert_eq!(dt.year(), 2024);
+            assert_eq!(dt.month(), 3);
+            assert_eq!(dt.day(), 15);
+            assert_eq!(dt.hour(), 10);
+            assert_eq!(dt.minute(), 30);
+            assert_eq!(dt.second(), 0);
+        }
+    }
+
+    #[test]
+    fn test_ivory_oratimestamp_parses_with_fractional_seconds() {
+        let typ = ivory_type("oratimestamp");
+        let cell =
+            TextFormatConverter::try_from_str(&typ, "2024-03-15 10:30:00.123456").unwrap();
+        assert!(matches!(cell, Cell::TimeStamp(_)));
+    }
+
+    #[test]
+    fn test_ivory_oratimestamptz_parses() {
+        let typ = ivory_type("oratimestamptz");
+        let cell =
+            TextFormatConverter::try_from_str(&typ, "2024-03-15 10:30:00.000000+05:30").unwrap();
+        assert!(matches!(cell, Cell::TimeStampTz(_)));
+    }
+
+    #[test]
+    fn test_ivory_yminterval_parses() {
+        // Positive: 2 years 3 months = 27 months
+        let cell = TextFormatConverter::try_from_str(&ivory_type("yminterval"), "+02-03").unwrap();
+        assert!(matches!(cell, Cell::I32(27)));
+
+        // Negative: -(1 year 6 months) = -18 months
+        let cell = TextFormatConverter::try_from_str(&ivory_type("yminterval"), "-01-06").unwrap();
+        assert!(matches!(cell, Cell::I32(-18)));
+
+        // No explicit sign
+        let cell = TextFormatConverter::try_from_str(&ivory_type("yminterval"), "00-00").unwrap();
+        assert!(matches!(cell, Cell::I32(0)));
+
+        // Overflow: INTERVAL YEAR(9) TO MONTH with max year precision → must return Err
+        let result =
+            TextFormatConverter::try_from_str(&ivory_type("yminterval"), "+999999999-11");
+        assert!(result.is_err(), "yminterval overflow must return Err");
+    }
+
+    #[test]
+    fn test_ivory_dsinterval_parses() {
+        // +5 days 3h 4m 5s = (5*86400 + 3*3600 + 4*60 + 5) * 1_000_000 µs
+        let expected: i64 = (5 * 86_400 + 3 * 3_600 + 4 * 60 + 5) * 1_000_000;
+        let cell = TextFormatConverter::try_from_str(
+            &ivory_type("dsinterval"),
+            "+000000005 03:04:05.000000000",
+        )
+        .unwrap();
+        assert!(matches!(cell, Cell::I64(v) if v == expected));
+
+        // With fractional seconds: 1 day 0h 0m 0.5s = 86400.5s = 86_400_500_000 µs
+        let expected: i64 = 86_400 * 1_000_000 + 500_000;
+        let cell = TextFormatConverter::try_from_str(
+            &ivory_type("dsinterval"),
+            "+000000001 00:00:00.500000",
+        )
+        .unwrap();
+        assert!(matches!(cell, Cell::I64(v) if v == expected));
+
+        // Negative
+        let cell = TextFormatConverter::try_from_str(
+            &ivory_type("dsinterval"),
+            "-000000001 00:00:00.000000",
+        )
+        .unwrap();
+        assert!(matches!(cell, Cell::I64(v) if v == -86_400 * 1_000_000));
+
+        // Overflow: 999_999_999 days exceeds i64 range → error
+        let result = TextFormatConverter::try_from_str(
+            &ivory_type("dsinterval"),
+            "+999999999 00:00:00.000000",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ivory_number_parses_as_numeric() {
+        let typ = ivory_type("number");
+        let cell = TextFormatConverter::try_from_str(&typ, "12345.67").unwrap();
+        assert!(matches!(cell, Cell::Numeric(_)));
+
+        let cell = TextFormatConverter::try_from_str(&typ, "42").unwrap();
+        assert!(matches!(cell, Cell::Numeric(_)));
+    }
+
+    #[test]
+    fn test_ivory_binary_float_double_parses() {
+        let cell =
+            TextFormatConverter::try_from_str(&ivory_type("binary_float"), "3.14").unwrap();
+        assert!(matches!(cell, Cell::F32(_)));
+
+        let cell =
+            TextFormatConverter::try_from_str(&ivory_type("binary_double"), "2.718281828").unwrap();
+        assert!(matches!(cell, Cell::F64(_)));
+
+        // NaN and Infinity must also parse
+        assert!(matches!(
+            TextFormatConverter::try_from_str(&ivory_type("binary_float"), "NaN").unwrap(),
+            Cell::F32(v) if v.is_nan()
+        ));
+    }
+
+    #[test]
+    fn test_ivory_char_varchar2_xmltype_parses_as_string() {
+        for type_name in [
+            "oravarcharchar",
+            "oravarcharbyte",
+            "oracharchar",
+            "oracharbyte",
+            "xmltype",
+        ] {
+            let cell =
+                TextFormatConverter::try_from_str(&ivory_type(type_name), "hello world").unwrap();
+            assert!(matches!(cell, Cell::String(ref s) if s == "hello world"), "{type_name}");
+        }
+    }
+
+    #[test]
+    fn test_ivory_raw_long_parses_as_bytes() {
+        // BYTEA-style hex encoding — both raw and long_raw map to Cell::Bytes
+        for type_name in ["raw", "long_raw"] {
+            let cell =
+                TextFormatConverter::try_from_str(&ivory_type(type_name), r"\xdeadbeef").unwrap();
+            assert!(
+                matches!(cell, Cell::Bytes(ref b) if b == &[0xde, 0xad, 0xbe, 0xef]),
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivory_default_value_returns_correct_variants() {
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("oradate")),
+            Cell::TimeStamp(_)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("oratimestamp")),
+            Cell::TimeStamp(_)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("oratimestamptz")),
+            Cell::TimeStampTz(_)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("yminterval")),
+            Cell::I32(0)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("dsinterval")),
+            Cell::I64(0)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("number")),
+            Cell::Numeric(_)
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("binary_float")),
+            Cell::F32(v) if v == 0.0
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("raw")),
+            Cell::Bytes(ref b) if b.is_empty()
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("long_raw")),
+            Cell::Bytes(ref b) if b.is_empty()
+        ));
+        assert!(matches!(
+            TextFormatConverter::default_value(&ivory_type("oravarcharchar")),
+            Cell::String(ref s) if s.is_empty()
         ));
     }
 }

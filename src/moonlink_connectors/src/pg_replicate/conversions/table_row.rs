@@ -206,4 +206,35 @@ mod tests {
             TableRowConversionError::NumColsMismatch
         ));
     }
+
+    /// Regression test for 改动3: verifies that the initial-copy row parsing path
+    /// (`TableRowConverter`) correctly handles IvorySQL Oracle-mode types that arrive
+    /// as `Kind::Simple` with custom OIDs.  This mirrors the real path used by
+    /// `spawn_sharded_copy_readers` → `TableRowConverter::try_from`.
+    #[test]
+    fn parse_ivory_oracle_types_in_initial_copy_row() {
+        use tokio_postgres::types::{Kind, Type};
+        fn ivory(name: &str) -> Type {
+            Type::new(name.to_string(), 99000, Kind::Simple, "sys".to_string())
+        }
+
+        let schemas = vec![
+            ColumnSchema { name: "id".into(),       typ: Type::INT4,      modifier: -1, nullable: false },
+            ColumnSchema { name: "created_at".into(), typ: ivory("oradate"), modifier: -1, nullable: false },
+            ColumnSchema { name: "name".into(),      typ: ivory("oravarcharchar"), modifier: -1, nullable: false },
+            ColumnSchema { name: "salary".into(),    typ: ivory("number"), modifier: -1, nullable: false },
+            ColumnSchema { name: "score".into(),     typ: ivory("binary_double"), modifier: -1, nullable: true },
+        ];
+
+        // COPY text row: id=1, oradate, varchar2, number, NULL score
+        let row = b"1\t2024-06-01 08:00:00\tAlice\t12345.67\t\\N\n";
+        let parsed = TableRowConverter::try_from(row, &schemas).unwrap();
+
+        assert_eq!(parsed.values.len(), 5);
+        assert!(matches!(parsed.values[0], Cell::I32(1)));
+        assert!(matches!(parsed.values[1], Cell::TimeStamp(_)), "oradate must parse to TimeStamp");
+        assert!(matches!(parsed.values[2], Cell::String(ref s) if s == "Alice"), "oravarcharchar must parse to String");
+        assert!(matches!(parsed.values[3], Cell::Numeric(_)), "number must parse to Numeric");
+        assert!(matches!(parsed.values[4], Cell::Null), "NULL must parse to Null");
+    }
 }
