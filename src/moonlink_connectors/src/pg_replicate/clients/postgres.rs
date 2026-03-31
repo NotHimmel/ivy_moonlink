@@ -435,6 +435,17 @@ impl ReplicationClient {
             let is_array_type = type_type == "b" && type_elem != 0;
 
             if !is_composite_type && !is_array_type {
+                // For simple base types not recognized by Type::from_oid() (e.g. IvorySQL
+                // Oracle-mode types such as varchar2, number, date), construct a Type with
+                // Kind::Simple so util.rs can handle them by name rather than failing here.
+                if type_type == "b" {
+                    return Ok(Type::new(
+                        type_name,
+                        type_oid,
+                        Kind::Simple,
+                        schema_name,
+                    ));
+                }
                 // Return error for unknown types
                 return Err(ReplicationClientError::UnsupportedType(
                     type_name,

@@ -1,5 +1,6 @@
 use crate::pg_replicate::{
     conversions::{numeric::PgNumeric, table_row::TableRow, ArrayCell, Cell},
+    ivoryql_types,
     table::{LookupKey, TableSchema},
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -14,19 +15,6 @@ use std::sync::Arc;
 use tokio_postgres::types::{Kind, Type};
 use tracing::warn;
 
-fn numeric_precision_scale(modifier: i32) -> Option<(u8, i8)> {
-    const VARHDRSZ: i32 = 4;
-    if modifier < VARHDRSZ {
-        return None;
-    }
-    let typmod = modifier - VARHDRSZ;
-    // Derived from: [https://github.com/postgres/postgres/blob/4fbb46f61271f4b7f46ecad3de608fc2f4d7d80f/src/backend/utils/adt/numeric.c#L929v]
-    let precision = ((typmod >> 16) & 0xffff) as u8;
-    // Derived from: [https://github.com/postgres/postgres/blob/4fbb46f61271f4b7f46ecad3de608fc2f4d7d80f/src/backend/utils/adt/numeric.c#L944]
-    let raw_scale = (typmod & 0x7ff);
-    let scale = ((raw_scale ^ 1024) - 1024) as i8;
-    Some((precision, scale))
-}
 
 enum ArrowExtensionType {
     Uuid,
@@ -51,7 +39,7 @@ fn postgres_primitive_to_arrow_type(
             // Numeric type can contain invalid values, we will cast them to NULL
             // so make it nullable.
             nullable = true;
-            let (precision, scale) = numeric_precision_scale(modifier)
+            let (precision, scale) = ivoryql_types::numeric_precision_scale(modifier)
                 .unwrap_or((DECIMAL128_MAX_PRECISION, DECIMAL_DEFAULT_SCALE));
             (DataType::Decimal128(precision, scale), None)
         }
@@ -83,12 +71,34 @@ fn postgres_primitive_to_arrow_type(
         Type::BYTEA => (DataType::Binary, None),
         // The type alias for postgres OID is uint32, but iceberg-rust doesn't support unsigned type, so use int64 instead.
         Type::OID => (DataType::Int64, None),
-        _ => (DataType::Utf8, None), // Default to string for unknown types
+        _ => {
+            // Handle IvorySQL Oracle-mode types by name (e.g. varchar2, number, date).
+            // These arrive here with Kind::Simple but OIDs unknown to Type::from_oid().
+            if let Some((ivory_data_type, force_nullable)) =
+                ivoryql_types::to_arrow_data_type(typ.name(), modifier)
+            {
+                if force_nullable {
+                    nullable = true;
+                }
+                (ivory_data_type, None)
+            } else {
+                (DataType::Utf8, None) // Default to string for unrecognized types
+            }
+        }
     };
 
     let mut field = Field::new(name, data_type, nullable);
     let mut metadata = HashMap::new();
     metadata.insert("PARQUET:field_id".to_string(), field_id.to_string());
+    // For IvorySQL types whose Arrow representation differs semantically (e.g. Oracle DATE
+    // stored as Timestamp), record the original type name so pg_duckdb can restore proper
+    // semantics when reading Iceberg files.
+    if let Some(ivory_type) = ivoryql_types::original_type_metadata(typ.name()) {
+        metadata.insert(
+            ivoryql_types::FIELD_META_IVORY_ORIGINAL_TYPE.to_string(),
+            ivory_type.to_string(),
+        );
+    }
     *field_id += 1;
     field = field.with_metadata(metadata);
 
@@ -186,7 +196,25 @@ pub fn postgres_schema_to_moonlink_schema(table_schema: &TableSchema) -> (Schema
         }
         LookupKey::FullRow => IdentityProp::FullRow,
     };
-    (Schema::new(fields), identity)
+
+    // If any column is an IvorySQL Oracle-mode type, annotate the schema so that
+    // downstream consumers (e.g. pg_duckdb) can apply correct type semantics.
+    let has_ivory_type = table_schema
+        .column_schemas
+        .iter()
+        .any(|col| ivoryql_types::is_ivory_type(&col.typ));
+    let schema = if has_ivory_type {
+        let mut schema_meta = HashMap::new();
+        schema_meta.insert(
+            ivoryql_types::SCHEMA_META_SOURCE_DIALECT.to_string(),
+            ivoryql_types::SOURCE_DIALECT_IVORYQL_ORACLE.to_string(),
+        );
+        Schema::new_with_metadata(fields, schema_meta)
+    } else {
+        Schema::new(fields)
+    };
+
+    (schema, identity)
 }
 
 pub(crate) struct PostgresTableRow(pub TableRow);
@@ -1109,6 +1137,240 @@ mod tests {
         assert_eq!(
             timestamp_array[1],
             RowValue::Int64(1704196800000000) // 2024-01-02 12:00:00 in microseconds
+        );
+    }
+
+    // ── IvorySQL schema conversion tests ────────────────────────────────────────
+    //
+    // These tests construct synthetic tokio_postgres::Type values with Kind::Simple
+    // and custom OIDs (as IvorySQL Oracle-mode types would appear) and verify that
+    // `postgres_schema_to_moonlink_schema` produces the correct Arrow fields and
+    // schema-level metadata — without requiring a live database connection.
+
+    fn ivory_type(name: &str) -> Type {
+        Type::new(name.to_string(), 99000, Kind::Simple, "sys".to_string())
+    }
+
+    fn ivory_col(name: &str, type_name: &str) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            typ: ivory_type(type_name),
+            modifier: -1,
+            nullable: false,
+        }
+    }
+
+    fn pg_col(name: &str, typ: Type) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            typ,
+            modifier: -1,
+            nullable: false,
+        }
+    }
+
+    fn make_table_schema(columns: Vec<ColumnSchema>) -> TableSchema {
+        TableSchema {
+            table_name: TableName {
+                schema: "public".to_string(),
+                name: "t".to_string(),
+            },
+            src_table_id: 1,
+            column_schemas: columns,
+            lookup_key: LookupKey::FullRow,
+        }
+    }
+
+    #[test]
+    fn test_ivory_date_maps_to_timestamp_not_date32() {
+        let ts = make_table_schema(vec![
+            pg_col("id", Type::INT4),
+            ivory_col("created_at", "oradate"),
+        ]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+
+        let field = schema.field_with_name("created_at").unwrap();
+        assert_eq!(
+            field.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            "Oracle DATE must map to Timestamp(us), not Date32"
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(ivoryql_types::FIELD_META_IVORY_ORIGINAL_TYPE),
+            Some(&"DATE".to_string()),
+            "Oracle DATE must carry ivory_original_type=DATE field metadata"
+        );
+    }
+
+    #[test]
+    fn test_ivory_timestamp_types() {
+        // oratimestamp — no timezone.
+        let ts = make_table_schema(vec![ivory_col("ts", "oratimestamp")]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema.field_with_name("ts").unwrap().data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+
+        // oratimestamptz / oratimestampltz — with timezone.
+        for type_name in ["oratimestamptz", "oratimestampltz"] {
+            let ts = make_table_schema(vec![ivory_col("ts", type_name)]);
+            let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+            assert_eq!(
+                schema.field_with_name("ts").unwrap().data_type(),
+                &DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into())
+                ),
+                "Expected Timestamp(us, UTC) for {type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivory_interval_types() {
+        let ts = make_table_schema(vec![ivory_col("ym", "yminterval")]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema.field_with_name("ym").unwrap().data_type(),
+            &DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth)
+        );
+
+        let ts = make_table_schema(vec![ivory_col("ds", "dsinterval")]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema.field_with_name("ds").unwrap().data_type(),
+            &DataType::Duration(arrow::datatypes::TimeUnit::Microsecond)
+        );
+    }
+
+    #[test]
+    fn test_ivory_char_varchar2_xmltype_map_to_utf8() {
+        for type_name in [
+            "oravarcharchar",
+            "oravarcharbyte",
+            "oracharchar",
+            "oracharbyte",
+            "xmltype",
+        ] {
+            let ts = make_table_schema(vec![ivory_col("col", type_name)]);
+            let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+            let field = schema.field_with_name("col").unwrap();
+            assert_eq!(field.data_type(), &DataType::Utf8, "{type_name} should map to Utf8");
+            assert!(
+                field
+                    .metadata()
+                    .get(ivoryql_types::FIELD_META_IVORY_ORIGINAL_TYPE)
+                    .is_none(),
+                "{type_name} should not have ivory_original_type metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivory_number_no_modifier_maps_to_decimal128() {
+        let ts = make_table_schema(vec![ivory_col("amount", "number")]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        let field = schema.field_with_name("amount").unwrap();
+        assert_eq!(
+            field.data_type(),
+            &DataType::Decimal128(DECIMAL128_MAX_PRECISION, DECIMAL_DEFAULT_SCALE),
+            "NUMBER without precision must map to Decimal128(38,10), same as PG NUMERIC"
+        );
+        assert!(field.is_nullable(), "NUMBER is always nullable (NaN/Inf → NULL)");
+    }
+
+    #[test]
+    fn test_ivory_number_with_precision_scale() {
+        // PG typmod encoding: modifier = VARHDRSZ(4) + (precision << 16) | raw_scale
+        // For precision=10, scale=2: raw_scale = 2 (verify: ((2^1024)-1024)=2 ✓)
+        let modifier: i32 = 4 + (10 << 16) | 2;
+        let ts = make_table_schema(vec![ColumnSchema {
+            name: "price".to_string(),
+            typ: ivory_type("number"),
+            modifier,
+            nullable: false,
+        }]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        let field = schema.field_with_name("price").unwrap();
+        assert_eq!(field.data_type(), &DataType::Decimal128(10, 2));
+        assert!(field.is_nullable(), "Decimal128 NUMBER must be nullable");
+    }
+
+    #[test]
+    fn test_ivory_raw_maps_to_binary() {
+        for type_name in ["raw", "long_raw"] {
+            let ts = make_table_schema(vec![ivory_col("data", type_name)]);
+            let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+            assert_eq!(
+                schema.field_with_name("data").unwrap().data_type(),
+                &DataType::Binary,
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivory_float_types() {
+        let ts = make_table_schema(vec![
+            ivory_col("f32", "binary_float"),
+            ivory_col("f64", "binary_double"),
+        ]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema.field_with_name("f32").unwrap().data_type(),
+            &DataType::Float32
+        );
+        assert_eq!(
+            schema.field_with_name("f64").unwrap().data_type(),
+            &DataType::Float64
+        );
+    }
+
+    #[test]
+    fn test_source_dialect_injected_when_ivory_type_present() {
+        let ts = make_table_schema(vec![
+            pg_col("id", Type::INT4),
+            ivory_col("name", "oravarcharchar"),
+        ]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema
+                .metadata()
+                .get(ivoryql_types::SCHEMA_META_SOURCE_DIALECT),
+            Some(&ivoryql_types::SOURCE_DIALECT_IVORYQL_ORACLE.to_string()),
+            "Schema must carry source_dialect=ivorySQL_oracle when any IvorySQL column is present"
+        );
+    }
+
+    #[test]
+    fn test_source_dialect_absent_for_pure_pg_schema() {
+        let ts = make_table_schema(vec![
+            pg_col("id", Type::INT4),
+            pg_col("name", Type::TEXT),
+            pg_col("ts", Type::TIMESTAMP),
+        ]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert!(
+            schema
+                .metadata()
+                .get(ivoryql_types::SCHEMA_META_SOURCE_DIALECT)
+                .is_none(),
+            "Standard PG schema must not have source_dialect metadata"
+        );
+    }
+
+    #[test]
+    fn test_standard_pg_date_still_maps_to_date32() {
+        // Regression: standard PG DATE must not be affected by the IvorySQL date override.
+        let ts = make_table_schema(vec![pg_col("d", Type::DATE)]);
+        let (schema, _) = postgres_schema_to_moonlink_schema(&ts);
+        assert_eq!(
+            schema.field_with_name("d").unwrap().data_type(),
+            &DataType::Date32,
+            "Standard PG DATE must still map to Date32"
         );
     }
 }

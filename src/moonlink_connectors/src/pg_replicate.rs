@@ -4,6 +4,7 @@ pub mod clients;
 pub mod conversions;
 pub mod initial_copy;
 pub mod initial_copy_writer;
+pub mod ivoryql_types;
 pub mod moonlink_sink;
 pub mod postgres_source;
 pub mod table;
