@@ -423,7 +423,7 @@ impl ReplicationClient {
             }
 
             // Query the database for the type information
-            let (type_name, type_relid, schema_name, type_type, type_elem) =
+            let (type_name, type_relid, schema_name, type_type, type_elem, type_basetype) =
                 self.get_type_info(type_oid).await?;
 
             // https://www.postgresql.org/docs/current/catalog-pg-type.html
@@ -445,6 +445,28 @@ impl ReplicationClient {
                         Kind::Simple,
                         schema_name,
                     ));
+                }
+                // Domain types (typtype == 'd'): IvorySQL implements the RAW family
+                // (raw, long_raw) as domains over bytea, so Type::from_oid() doesn't
+                // know about them. Preserve the domain's own name/OID/schema so
+                // ivoryql_types::is_ivory_type can recognize it and dispatch to the
+                // right Arrow mapping. For generic user-defined PG domains (not in
+                // the IvorySQL `sys` schema or not a known IvorySQL typname), fall
+                // through to the underlying typbasetype — that matches standard PG
+                // semantics where a domain is transparent for value-level operations.
+                if type_type == "d" {
+                    let candidate = Type::new(
+                        type_name.clone(),
+                        type_oid,
+                        Kind::Simple,
+                        schema_name.clone(),
+                    );
+                    if crate::pg_replicate::ivoryql_types::is_ivory_type(&candidate) {
+                        return Ok(candidate);
+                    }
+                    if type_basetype != 0 {
+                        return self.resolve_type(type_basetype).await;
+                    }
                 }
                 // Return error for unknown types
                 return Err(ReplicationClientError::UnsupportedType(
@@ -481,9 +503,9 @@ impl ReplicationClient {
     async fn get_type_info(
         &self,
         type_oid: u32,
-    ) -> Result<(String, u32, String, String, u32), ReplicationClientError> {
+    ) -> Result<(String, u32, String, String, u32, u32), ReplicationClientError> {
         let type_query = format!(
-            "SELECT t.typname, t.typrelid, n.nspname, t.typtype, t.typelem
+            "SELECT t.typname, t.typrelid, n.nspname, t.typtype, t.typelem, t.typbasetype
          FROM pg_type t
          JOIN pg_namespace n ON t.typnamespace = n.oid
          WHERE t.oid = {}",
@@ -495,6 +517,7 @@ impl ReplicationClient {
         let mut schema_name = String::new();
         let mut type_type = String::new();
         let mut type_elem = 0;
+        let mut type_basetype = 0;
 
         // Query should return exactly one row since we're querying by OID which is unique
         let mut row_count = 0;
@@ -505,6 +528,7 @@ impl ReplicationClient {
                 schema_name = row.get("nspname").unwrap().to_string();
                 type_type = row.get("typtype").unwrap().to_string();
                 type_elem = row.get("typelem").unwrap().parse().unwrap_or(0);
+                type_basetype = row.get("typbasetype").unwrap().parse().unwrap_or(0);
                 row_count += 1;
             }
         }
@@ -514,7 +538,14 @@ impl ReplicationClient {
             type_oid
         );
 
-        Ok((type_name, type_relid, schema_name, type_type, type_elem))
+        Ok((
+            type_name,
+            type_relid,
+            schema_name,
+            type_type,
+            type_elem,
+            type_basetype,
+        ))
     }
 
     /// Query composite type fields by relation ID
