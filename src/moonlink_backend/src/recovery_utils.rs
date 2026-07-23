@@ -1,5 +1,6 @@
 use crate::error::Result;
 use moonlink::MooncakeTableId;
+use moonlink_error::ErrorStatus;
 use moonlink::ReadStateFilepathRemap;
 use moonlink::{BaseIcebergSnapshotFetcher, IcebergSnapshotFetcher};
 use moonlink_connectors::{ReplicationManager, REST_API_URI};
@@ -142,17 +143,47 @@ pub(super) async fn recover_all_tables(
             .moonlink_table_config
             .mooncake_table_config
             .temp_files_directory = backend_attributes.temp_files_dir.clone();
-        // Recover current table; rest table doesn't require replication.
-        if cur_metadata_entry.src_table_uri != REST_API_URI {
-            unique_uris.insert(cur_metadata_entry.src_table_uri.clone());
-        }
-        recover_table(
+        let src_table_uri = cur_metadata_entry.src_table_uri.clone();
+        let table_id = format!(
+            "{}.{}",
+            cur_metadata_entry.database, cur_metadata_entry.table
+        );
+        match recover_table(
             backend_attributes.clone(),
             cur_metadata_entry,
             replication_manager,
             read_state_filepath_remap.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {
+                // Only replicate URIs whose table actually recovered; rest
+                // tables don't require replication.
+                if src_table_uri != REST_API_URI {
+                    unique_uris.insert(src_table_uri);
+                }
+            }
+            // A permanently failed table (e.g. its source database was dropped
+            // wholesale — DROP DATABASE fires no per-table sql_drop triggers,
+            // so its metadata rows survive here) must not abort recovery:
+            // propagating the error crash-loops the whole bgworker and takes
+            // down every healthy table with it. Skip it and keep going. The
+            // stale row is intentionally NOT garbage-collected: error
+            // categorization is still coarse (most postgres errors map to
+            // Permanent), and deleting metadata on a misclassified transient
+            // failure would silently unlink a live table.
+            Err(e) if e.get_status() == ErrorStatus::Permanent => {
+                tracing::warn!(
+                    table = %table_id,
+                    error = %e,
+                    "skipping unrecoverable table during recovery; \
+                     drop it or clean its metadata entry to silence this warning"
+                );
+            }
+            // Transient errors (network hiccups etc.) stay fatal so the
+            // bgworker restart can retry the full recovery.
+            Err(e) => return Err(e),
+        }
     }
 
     for uri in unique_uris.into_iter() {
