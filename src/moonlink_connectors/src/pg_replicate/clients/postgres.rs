@@ -266,6 +266,15 @@ impl ReplicationClient {
         Ok(stream)
     }
 
+    /// Returns the server version as an integer (e.g. 140000 for PG14, 150000 for PG15).
+    async fn server_version_num(&self) -> Result<i32, ReplicationClientError> {
+        let row = self
+            .postgres_client
+            .query_one("SELECT current_setting('server_version_num')::int;", &[])
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// Returns a vector of columns of a table, optionally filtered by a publication's column list
     pub async fn get_column_schemas(
         &self,
@@ -273,8 +282,14 @@ impl ReplicationClient {
         table_name: &TableName,
         publication: Option<&str>,
     ) -> Result<Vec<ColumnSchema>, ReplicationClientError> {
-        let (pub_cte, pub_pred) = if let Some(publication) = publication {
-            (
+        // pg_publication_rel.prattrs (per-column publication lists) was added in
+        // PG15. On PG14 the column does not exist and referencing it fails at
+        // parse time, so we must omit the column-filter CTE entirely. PG14
+        // publications have no column-list concept: all columns are published.
+        let supports_pub_columns = self.server_version_num().await? >= 150000;
+
+        let (pub_cte, pub_pred) = match publication {
+            Some(publication) if supports_pub_columns => (
                 format!(
                     "with pub_attrs as (
                         select unnest(r.prattrs) AS pub_attnum
@@ -292,9 +307,9 @@ impl ReplicationClient {
                     else (a.attnum in (select pub_attnum from pub_attrs))
                     end
                 )",
-            )
-        } else {
-            ("".into(), "")
+            ),
+            // PG14, or no publication filter requested: take all columns.
+            _ => ("".into(), ""),
         };
 
         let column_info_query = format!(
