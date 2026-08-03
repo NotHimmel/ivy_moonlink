@@ -332,6 +332,21 @@ impl IcebergTableManager {
             }
         }
 
+        tracing::info!(
+            table_id = self.mooncake_table_metadata.table_id,
+            data_files = self.persisted_data_files.len(),
+            file_indices = loaded_file_indices.len(),
+            index_referenced_files = loaded_file_indices
+                .iter()
+                .map(|idx| idx.files.len())
+                .sum::<usize>(),
+            index_rows = ?loaded_file_indices
+                .iter()
+                .map(|idx| (idx.num_rows, idx.hash_bits, idx.index_blocks.len()))
+                .collect::<Vec<_>>(),
+            flush_lsn = ?snapshot_property.flush_lsn,
+            "iceberg snapshot loaded for recovery"
+        );
         let mooncake_snapshot = self.transform_to_mooncake_snapshot(
             loaded_deletion_vector,
             loaded_file_indices,

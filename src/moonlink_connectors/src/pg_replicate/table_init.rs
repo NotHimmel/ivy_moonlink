@@ -161,8 +161,9 @@ pub async fn build_table_components(
     let replication_lsn_rx = replication_state.subscribe();
     let commit_lsn_rx = commit_state.subscribe();
     if let Some(persistence_snapshot_lsn) = last_persistence_snapshot_lsn {
-        commit_state.mark(persistence_snapshot_lsn);
+        // Replication LSN first: readers assert commit_lsn <= replication_lsn.
         replication_state.mark(persistence_snapshot_lsn);
+        commit_state.mark(persistence_snapshot_lsn);
     }
 
     let read_state_manager = ReadStateManager::new(

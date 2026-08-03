@@ -49,6 +49,9 @@ pub enum PostgresSourceError {
 
     #[error("invalid source table name: {0}")]
     InvalidSourceTableName(String),
+
+    #[error("source table {0} already has a mirror table; replication events are routed per source table, so a second mirror is not supported")]
+    TableAlreadyMirrored(String),
 }
 
 pub struct PostgresSource {
@@ -589,10 +592,20 @@ impl CdcStream {
 
     pub fn add_table_schema(self: Pin<&mut Self>, schema: TableSchema) {
         let this = self.project();
-        assert!(this
+        // A schema may legitimately be re-added when a previous create_table
+        // attempt failed partway (its AddTable reached the event loop but the
+        // overall operation was rolled back) and is retried. The schema for a
+        // given src_table_id is identical in that case, so overwrite instead
+        // of asserting: panicking here killed the whole replication event
+        // loop, stopping ingestion for every table and opening a window where
+        // confirmed-but-unapplied transactions were silently lost.
+        if this
             .table_schemas
             .insert(schema.src_table_id, schema)
-            .is_none());
+            .is_some()
+        {
+            tracing::warn!("table schema re-added for existing table; overwriting");
+        }
     }
 
     pub fn update_table_schema(self: Pin<&mut Self>, schema: TableSchema) {

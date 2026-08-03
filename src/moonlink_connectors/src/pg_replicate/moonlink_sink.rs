@@ -36,6 +36,16 @@ struct ColumnInfo {
 pub struct Sink {
     event_senders: HashMap<SrcTableId, Sender<TableEvent>>,
     commit_lsn_txs: HashMap<SrcTableId, Arc<CommitState>>,
+    /// Per-table recovery baseline: everything with commit LSN <= this value
+    /// is already reflected in the table's recovered state (iceberg snapshot
+    /// plus moonlink-WAL replay). After a restart the replication slot resumes
+    /// from the MINIMUM confirmed-flush LSN across all tables, so Postgres
+    /// redelivers transactions the more advanced tables already contain;
+    /// applying those again made recovery replay deletions whose target rows
+    /// were gone and panicked in snapshot.rs ("find less than expected
+    /// candidates to deletions"). Events at or below the baseline are dropped
+    /// for that table. Absent entry (or 0) means no gating.
+    recovery_baseline_lsns: HashMap<SrcTableId, u64>,
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
     replication_state: Arc<ReplicationState>,
@@ -71,6 +81,7 @@ impl Sink {
         Self {
             event_senders: HashMap::new(),
             commit_lsn_txs: HashMap::new(),
+            recovery_baseline_lsns: HashMap::new(),
             streaming_transactions_state: HashMap::new(),
             transaction_state: TransactionState {
                 final_lsn: 0,
@@ -114,9 +125,34 @@ impl Sink {
             .collect();
         self.relation_cache.insert(src_table_id, columns);
     }
+    /// Set the recovery baseline for a table (see `recovery_baseline_lsns`).
+    /// Called right after `add_table` when the table went through recovery.
+    pub fn set_recovery_baseline_lsn(&mut self, src_table_id: SrcTableId, baseline_lsn: u64) {
+        if baseline_lsn > 0 {
+            self.recovery_baseline_lsns
+                .insert(src_table_id, baseline_lsn);
+        }
+    }
+
+    /// True when `commit_lsn` is already covered by the table's recovered
+    /// state and the event must not be applied again.
+    fn is_recovered_duplicate(&self, src_table_id: SrcTableId, commit_lsn: u64) -> bool {
+        commit_lsn != 0
+            && self
+                .recovery_baseline_lsns
+                .get(&src_table_id)
+                .is_some_and(|baseline| commit_lsn <= *baseline)
+    }
+
     pub fn drop_table(&mut self, src_table_id: SrcTableId) {
-        self.event_senders.remove(&src_table_id).unwrap();
-        self.commit_lsn_txs.remove(&src_table_id).unwrap();
+        // Tolerate a table that never fully registered (cleanup after a
+        // failed create_table): panicking here would kill the whole
+        // replication event loop.
+        if self.event_senders.remove(&src_table_id).is_none() {
+            warn!(src_table_id, "drop_table for unregistered table; ignoring");
+        }
+        self.commit_lsn_txs.remove(&src_table_id);
+        self.recovery_baseline_lsns.remove(&src_table_id);
         if let Some((cached_id, _)) = &self.cached_event_sender {
             if *cached_id == src_table_id {
                 self.cached_event_sender = None;
@@ -213,7 +249,19 @@ impl Sink {
             CdcEvent::Commit(commit_body) => {
                 debug!(end_lsn = commit_body.end_lsn(), "commit transaction");
                 ma::assert_ge!(commit_body.end_lsn(), self.max_keepalive_lsn_seen);
+                // Advance the global replication LSN BEFORE the per-table
+                // commit LSNs: readers assert commit_lsn <= replication_lsn,
+                // and the loop below awaits between table marks, giving
+                // readers a window to observe a commit LSN ahead of the
+                // replication LSN if it were marked last.
+                self.replication_state
+                    .mark(u64::from(PgLsn::from(commit_body.end_lsn())));
                 for table_id in &self.transaction_state.touched_tables {
+                    if self.is_recovered_duplicate(*table_id, commit_body.end_lsn()) {
+                        // Transaction is already part of this table's recovered
+                        // state; its row events were dropped above.
+                        continue;
+                    }
                     let event_sender = self.event_senders.get(table_id);
                     if let Some(commit_lsn_tx) = self.commit_lsn_txs.get(table_id) {
                         commit_lsn_tx.mark(commit_body.end_lsn());
@@ -236,8 +284,6 @@ impl Sink {
                 self.transaction_state.touched_tables.clear();
                 self.transaction_state.last_touched_table = None;
                 self.streaming_last_key = None;
-                let pg_lsn = PgLsn::from(commit_body.end_lsn());
-                self.replication_state.mark(pg_lsn.into());
             }
             CdcEvent::StreamCommit(stream_commit_body) => {
                 let xact_id = stream_commit_body.xid();
@@ -247,9 +293,34 @@ impl Sink {
                     "stream commit"
                 );
                 ma::assert_ge!(stream_commit_body.end_lsn(), self.max_keepalive_lsn_seen);
+                // Same ordering requirement as CdcEvent::Commit: global
+                // replication LSN first, per-table commit LSNs after.
+                self.replication_state
+                    .mark(u64::from(PgLsn::from(stream_commit_body.end_lsn())));
                 if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
                     for table_id in &tables_in_txn.touched_tables {
                         let event_sender = self.event_senders.get(table_id);
+                        // Streamed row events carry lsn 0 and are buffered by
+                        // xact_id in the table handler, so a replayed streamed
+                        // transaction is dropped here at commit time: abort the
+                        // buffered events instead of committing them again.
+                        if self.is_recovered_duplicate(*table_id, stream_commit_body.end_lsn()) {
+                            if let Some(event_sender) = event_sender {
+                                if let Err(e) = Self::send_table_event(
+                                    event_sender,
+                                    TableEvent::StreamAbort {
+                                        xact_id,
+                                        is_recovery: false,
+                                        closes_incomplete_wal_transaction: false,
+                                    },
+                                )
+                                .await
+                                {
+                                    warn!(error = ?e, "failed to send stream abort for recovered duplicate");
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(commit_lsn_tx) = self.commit_lsn_txs.get(table_id) {
                             commit_lsn_tx.mark(stream_commit_body.end_lsn());
                         }
@@ -271,11 +342,12 @@ impl Sink {
                     self.streaming_transactions_state.remove(&xact_id);
                 }
                 self.streaming_last_key = None;
-                let pg_lsn = PgLsn::from(stream_commit_body.end_lsn());
-                self.replication_state.mark(pg_lsn.into());
             }
             CdcEvent::Insert((table_id, table_row, xact_id)) => {
                 let final_lsn = self.get_final_lsn(table_id, xact_id);
+                if xact_id.is_none() && self.is_recovered_duplicate(table_id, final_lsn) {
+                    return Ok(None);
+                }
                 if let Some(event_sender) = self.get_event_sender_for(table_id) {
                     if let Err(e) = Self::send_table_event(
                         event_sender,
@@ -294,6 +366,9 @@ impl Sink {
             }
             CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
                 let final_lsn = self.get_final_lsn(table_id, xact_id);
+                if xact_id.is_none() && self.is_recovered_duplicate(table_id, final_lsn) {
+                    return Ok(None);
+                }
                 if let Some(event_sender) = self.get_event_sender_for(table_id) {
                     if let Err(e) = Self::send_table_event(
                         event_sender,
@@ -326,6 +401,9 @@ impl Sink {
             }
             CdcEvent::Delete((table_id, table_row, xact_id)) => {
                 let final_lsn = self.get_final_lsn(table_id, xact_id);
+                if xact_id.is_none() && self.is_recovered_duplicate(table_id, final_lsn) {
+                    return Ok(None);
+                }
                 if let Some(event_sender) = self.get_event_sender_for(table_id) {
                     if let Err(e) = Self::send_table_event(
                         event_sender,

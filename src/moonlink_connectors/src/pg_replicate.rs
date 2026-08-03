@@ -69,6 +69,10 @@ pub enum PostgresReplicationCommand {
         commit_state: Arc<CommitState>,
         flush_lsn_rx: watch::Receiver<u64>,
         wal_flush_lsn_rx: watch::Receiver<u64>,
+        /// Commit LSN already covered by the table's recovered state
+        /// (iceberg snapshot + moonlink-WAL replay); 0 when not recovering.
+        /// The sink drops redelivered events at or below this LSN.
+        recovery_baseline_lsn: u64,
         ready_tx: oneshot::Sender<()>,
     },
     DropTable {
@@ -86,6 +90,11 @@ pub struct PostgresConnection {
     pub cmd_rx: Option<mpsc::Receiver<PostgresReplicationCommand>>,
     pub replication_state: Arc<ReplicationState>,
     pub retry_handles: Vec<JoinHandle<Result<()>>>,
+    /// Source tables that currently have a mirror attached. Replication
+    /// events are routed per src_table_id (one event sender per source
+    /// table), so a second mirror on the same source table would silently
+    /// steal the first one's change stream — reject it up front instead.
+    registered_src_tables: HashSet<SrcTableId>,
 }
 
 impl PostgresConnection {
@@ -156,6 +165,7 @@ impl PostgresConnection {
             cmd_rx: Some(cmd_rx),
             replication_state: ReplicationState::new(),
             retry_handles: Vec::new(),
+            registered_src_tables: HashSet::new(),
         })
     }
 
@@ -295,9 +305,11 @@ impl PostgresConnection {
                 error!(error = ?e, table_id = src_table_id, "failed to send FinishTableCopy command");
             }
 
-            // Notify read state manager with the commit LSN for the initial copy boundary.
-            commit_lsn_tx.mark(progress.boundary_lsn.into());
+            // Notify read state manager with the commit LSN for the initial copy
+            // boundary. Replication first: readers assert
+            // commit_lsn <= replication_lsn.
             self.replication_state.mark(progress.boundary_lsn.into());
+            commit_lsn_tx.mark(progress.boundary_lsn.into());
 
             Ok(true)
         } else {
@@ -399,6 +411,7 @@ impl PostgresConnection {
         commit_state: Arc<CommitState>,
         flush_lsn_rx: watch::Receiver<u64>,
         wal_flush_lsn_rx: watch::Receiver<u64>,
+        recovery_baseline_lsn: u64,
     ) -> Result<oneshot::Receiver<()>> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let cmd = PostgresReplicationCommand::AddTable {
@@ -408,6 +421,7 @@ impl PostgresConnection {
             commit_state,
             flush_lsn_rx,
             wal_flush_lsn_rx,
+            recovery_baseline_lsn,
             ready_tx,
         };
         self.cmd_tx.send(cmd).await?;
@@ -497,6 +511,15 @@ impl PostgresConnection {
             .fetch_table_schema(None, Some(table_name), None)
             .await?;
 
+        if !self
+            .registered_src_tables
+            .insert(table_schema.src_table_id)
+        {
+            return Err(
+                PostgresSourceError::TableAlreadyMirrored(table_name.to_string()).into(),
+            );
+        }
+
         let (arrow_schema, identity) =
             crate::pg_replicate::util::postgres_schema_to_moonlink_schema(&table_schema);
         moonlink_table_config.mooncake_table_config.row_identity = identity;
@@ -524,6 +547,24 @@ impl PostgresConnection {
             .take()
             .expect("commit_lsn_tx is None");
         let commit_lsn_tx_for_copy = commit_lsn_tx.clone();
+        // Everything at or below this LSN is already reflected in the
+        // recovered table state (iceberg snapshot, plus the moonlink-WAL
+        // replay that runs below and covers up to the WAL's highest
+        // completion LSN). The replication slot restarts from the minimum
+        // confirmed-flush LSN across all tables, so Postgres may redeliver
+        // older transactions; the sink drops them for this table instead of
+        // double-applying (which panicked recovery on replayed deletions).
+        let recovery_baseline_lsn = if is_recovery {
+            let snapshot_lsn = table_resources.last_persistence_snapshot_lsn.unwrap_or(0);
+            let wal_lsn = table_resources
+                .wal_persistence_metadata
+                .as_ref()
+                .map(|m| m.get_highest_completion_lsn())
+                .unwrap_or(0);
+            snapshot_lsn.max(wal_lsn)
+        } else {
+            0
+        };
         let ready_rx = self
             .add_table_to_replication(
                 table_schema.src_table_id,
@@ -538,6 +579,7 @@ impl PostgresConnection {
                     .wal_flush_lsn_rx
                     .take()
                     .expect("wal_flush_lsn_rx is None"),
+                recovery_baseline_lsn,
             )
             .await?;
 
@@ -547,7 +589,8 @@ impl PostgresConnection {
         }
 
         // Perform initial copy
-        let initial_copy_performed = self
+        let commit_lsn_tx_for_recovery = commit_lsn_tx_for_copy.clone();
+        let initial_copy_performed = match self
             .perform_initial_copy(
                 &table_schema,
                 table_resources.event_sender.clone(),
@@ -555,7 +598,25 @@ impl PostgresConnection {
                 commit_lsn_tx_for_copy,
                 table_base_path,
             )
-            .await?;
+            .await
+        {
+            Ok(performed) => performed,
+            Err(e) => {
+                // The table is already registered in the replication event
+                // loop at this point. Unhook it best-effort so a retried
+                // create_table starts from a clean slate instead of tripping
+                // over the half-registered leftovers.
+                self.registered_src_tables.remove(&table_schema.src_table_id);
+                if let Err(cleanup_err) = self
+                    .drop_table_from_replication(table_schema.src_table_id)
+                    .await
+                {
+                    warn!(error = ?cleanup_err, src_table_id = table_schema.src_table_id,
+                          "failed to unregister table after initial copy failure");
+                }
+                return Err(e);
+            }
+        };
 
         if is_recovery {
             assert!(
@@ -566,6 +627,12 @@ impl PostgresConnection {
                 "Performing recovery for table with ID {:?}",
                 table_schema.src_table_id
             );
+            // WAL replay advances this table's commit LSN up to the WAL's
+            // highest completion LSN, but nothing on the replay path advances
+            // the global replication LSN (it normally moves with the CDC
+            // stream). Readers assert commit_lsn <= replication_lsn, so
+            // pre-advance replication to the recovery baseline first.
+            self.replication_state.mark(recovery_baseline_lsn);
             // Perform recovery
             WalManager::replay_recovery_from_wal(
                 table_resources.event_sender.clone(),
@@ -574,6 +641,13 @@ impl PostgresConnection {
                 table_resources.last_persistence_snapshot_lsn,
             )
             .await?;
+            // WAL replay can advance the table's mooncake snapshot up to the
+            // recovery baseline, but the commit watch was only initialized to
+            // the iceberg snapshot LSN. Readers assert
+            // snapshot_lsn <= commit_lsn <= replication_lsn, so bring the
+            // commit watch up to the baseline as well (replication was
+            // already marked above; mark() is monotonic so this is safe).
+            commit_lsn_tx_for_recovery.mark(recovery_baseline_lsn);
             debug!(
                 "Finished recovery for table with ID {:?}",
                 table_schema.src_table_id
@@ -588,6 +662,8 @@ impl PostgresConnection {
     /// Drop table from PostgreSQL replication
     pub async fn drop_table(&mut self, src_table_id: u32, table_name: &str) -> Result<()> {
         debug!(src_table_id, "dropping table");
+
+        self.registered_src_tables.remove(&src_table_id);
 
         // Remove table from publication as the first step, to prevent further events.
         self.remove_table_from_publication(table_name).await?;
@@ -761,8 +837,9 @@ pub async fn run_event_loop(
                     }
                 },
                 Some(cmd) = cmd_rx.recv() => match cmd {
-                    PostgresReplicationCommand::AddTable { src_table_id, schema, event_sender, commit_state, flush_lsn_rx, wal_flush_lsn_rx, ready_tx } => {
+                    PostgresReplicationCommand::AddTable { src_table_id, schema, event_sender, commit_state, flush_lsn_rx, wal_flush_lsn_rx, recovery_baseline_lsn, ready_tx } => {
                         sink.add_table(src_table_id, event_sender, commit_state, &schema);
+                        sink.set_recovery_baseline_lsn(src_table_id, recovery_baseline_lsn);
                         flush_lsn_rxs.insert(src_table_id, flush_lsn_rx);
                         wal_flush_lsn_rxs.insert(src_table_id, wal_flush_lsn_rx);
                         stream.as_mut().add_table_schema(schema);

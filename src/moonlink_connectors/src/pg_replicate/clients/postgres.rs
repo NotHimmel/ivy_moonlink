@@ -145,8 +145,22 @@ impl ReplicationClient {
             "ALTER PUBLICATION moonlink_pub ADD TABLE {};",
             table_name.as_quoted_identifier()
         );
-        self.postgres_client.simple_query(&query).await?;
-        Ok(())
+        match self.postgres_client.simple_query(&query).await {
+            Ok(_) => Ok(()),
+            // Idempotent: the table already being a member IS the desired
+            // state. This happens when a previous create_table attempt failed
+            // after the publication step, or when a second mirror is created
+            // for the same source table. Postgres has no ADD TABLE IF NOT
+            // EXISTS, so detect SQLSTATE 42710 (duplicate_object) instead.
+            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_OBJECT) => {
+                warn!(
+                    table = %table_name.as_quoted_identifier(),
+                    "table already in publication moonlink_pub; continuing"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_row_count(
