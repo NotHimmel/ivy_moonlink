@@ -1,6 +1,28 @@
 use super::moonlink_type::RowValue;
 use crate::row::arrow_converter;
 use ahash::AHasher;
+use ahash::RandomState;
+use std::hash::BuildHasher;
+
+/// Lookup keys produced by `get_lookup_key` end up persisted inside file-index
+/// blobs (iceberg puffin index files). The hash therefore MUST be stable
+/// across processes and builds: `AHasher::default()` seeds itself randomly on
+/// first use in each process (ahash `std` feature), which silently made every
+/// persisted index unreadable after a restart — index lookups returned zero
+/// candidates and deletion processing panicked with "find less than expected
+/// candidates to deletions". Fixed seeds keep the key deterministic;
+/// DOS-resistance is irrelevant for internal row-identity keys.
+/// Changing these seeds invalidates already-persisted file indices.
+static LOOKUP_KEY_HASHER: RandomState = RandomState::with_seeds(
+    0x8f2c_1d4b_9a6e_3057,
+    0x1b7d_5c3a_e894_f620,
+    0xd4a2_96f8_0b3e_71c5,
+    0x6e91_37ac_52d8_b04f,
+);
+
+fn lookup_key_hasher() -> AHasher {
+    LOOKUP_KEY_HASHER.build_hasher()
+}
 use arrow::array::Array;
 use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
@@ -335,14 +357,14 @@ impl IdentityProp {
         match self {
             IdentityProp::SinglePrimitiveKey(key) => row.values[*key].to_u64_key(),
             IdentityProp::Keys(keys) => {
-                let mut hasher = AHasher::default();
+                let mut hasher = lookup_key_hasher();
                 for key in keys {
                     row.values[*key].hash(&mut hasher);
                 }
                 hasher.finish()
             }
             IdentityProp::FullRow => {
-                let mut hasher = AHasher::default();
+                let mut hasher = lookup_key_hasher();
                 for value in row.values.iter() {
                     value.hash(&mut hasher);
                 }
@@ -359,14 +381,14 @@ impl IdentityProp {
             IdentityProp::SinglePrimitiveKey(_) => row.values[0].to_u64_key(),
             IdentityProp::Keys(keys) => {
                 assert_eq!(row.values.len(), keys.len());
-                let mut hasher = AHasher::default();
+                let mut hasher = lookup_key_hasher();
                 for i in 0..keys.len() {
                     row.values[i].hash(&mut hasher);
                 }
                 hasher.finish()
             }
             IdentityProp::FullRow => {
-                let mut hasher = AHasher::default();
+                let mut hasher = lookup_key_hasher();
                 for value in row.values.iter() {
                     value.hash(&mut hasher);
                 }
